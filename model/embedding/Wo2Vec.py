@@ -20,10 +20,8 @@ from configparser import ConfigParser
 from collections import Counter
 import os
 
-current_path = os.path.dirname(__file__)
+current_path = os.path.dirname(os.getcwd())
 home_path = os.path.expanduser('~') + "/zhu/"
-print(home_path)
-exit(1)
 
 random.seed(1)
 np.random.seed(1)
@@ -31,13 +29,14 @@ torch.manual_seed(1)
 
 # Word2Vec模型
 class Wo2Vec(nn.Module):
-    def __init__(self, vocab_size, embed_size) -> None:
+    def __init__(self, vocab_size, embed_size, device) -> None:
         """定义Word2Vec网络
 
         Arguments:
             vocab_size -- 词典大小
             embed_size -- 隐藏层embedding长度
         """
+        self.device = device
         super(Wo2Vec, self).__init__()
        
         self.vocab_size = int(vocab_size)
@@ -58,11 +57,11 @@ class Wo2Vec(nn.Module):
             neg_word    -- 负采样词
         """
         # 计算中心词向量 [batch_size, embed_dim]
-        centor_word_emb = self.in_emb(centor_word)
+        centor_word_emb = self.in_emb(centor_word).to(self.device)
         # 计算窗口词向量 [batch_size, (window * 2), embed_dim]
-        window_word_emb = self.out_emb(window_word)
+        window_word_emb = self.out_emb(window_word).to(self.device)
         # 负采样词向量[batch_size, (window * 2 * k), embed_dim]
-        neg_word_emb = self.out_emb(neg_word)
+        neg_word_emb = self.out_emb(neg_word).to(self.device)
 
         # 前向计算
         # 将中心词的表示扩展为需要的维度
@@ -78,7 +77,7 @@ class Wo2Vec(nn.Module):
         # 负样本同样的操作
         # 注意负号，参考公式可以知负样本的概率越小越好，所以位负号
         # [batch_size, (window * 2 * K), 1]
-        neg_dot = torch.bmm(neg_word_emb, -centor_word_emb)
+        neg_dot = torch.bmm(neg_word_emb, -centor_word_emb).to(self.device)
         neg_dot.squeeze(2)
 
         # Softmax
@@ -105,6 +104,7 @@ class Wo2VecDataSet(tud.Dataset):
             word2idx -- _description_
             word_freqs -- _description_
         """
+        global current_path
         super(Wo2VecDataSet, self).__init__()
         # 注意下面重写的方法
         # 将语句转换为word编码 
@@ -115,7 +115,8 @@ class Wo2VecDataSet(tud.Dataset):
         self.word_freqs = torch.Tensor(word_freqs)
         # 窗口大小
         config = ConfigParser()
-        config.read(current_path + "/../config/word2Vec.ini")
+        config.read(current_path + "/config/word2vec.ini")
+      
         self.C = int(config.get("model", "C"))
         self.K = int(config.get("model", "K"))
 
@@ -150,26 +151,29 @@ class Wo2VecDataSet(tud.Dataset):
         # 实际上从这里就可以看出，这里用的是skip-gram方法，并且采用负采样（Negative Sampling）进行优化
         neg_words = torch.multinomial(self.word_freqs, self.K * pos_words.shape[0], True)
         
+    
         # while 循环是为了保证 neg_words中不能包含周围词
         # Angel Hair：实际上不需要这么处理，因为我们遇到的都是非常大的数据，会导致取到周围词的概率非常非常小，
         # 这里之所以这么做是因为本文和参考文所提供的数据太小，导致这个概率变大了，会影响模型
         while len(set(pos_indices) & set(neg_words.numpy().tolist())) > 0:
              neg_words = torch.multinomial(self.word_freqs, self.K * pos_words.shape[0], True)
-        
+      
         return center_words, pos_words, neg_words
 
 # 模型使用
 class Wo2VecPipe():
-    def __init__(self) -> None:
+    def __init__(self, device) -> None:
         # 窗口大小
+        global current_path
         config = ConfigParser()
-        config.read(current_path + "/../config/word2vec.ini")
+        config.read(current_path + "/config/word2vec.ini")
 
         self.MAX_VOCAB_SIZE = int(config.get("model", "MAX_VOCAB_SIZE")) 
         self.EMBEDDING_SIZE = int(config.get("model", "EMBEDDING_SIZE"))
         self.batch_size = int(config.get("model", "batch_size"))
         self.epochs = int(config.get("model", "epochs"))
         self.embedding_weights = None
+        self.device = device
         return
     
 
@@ -177,11 +181,11 @@ class Wo2VecPipe():
         """
         训练数据
         """
-        model = Wo2Vec(self.MAX_VOCAB_SIZE, self.EMBEDDING_SIZE)
+        model = Wo2Vec(self.MAX_VOCAB_SIZE, self.EMBEDDING_SIZE, self.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         self.dataset = Wo2VecDataSet(text, word2idx, word_freqs)
         dataloader = tud.DataLoader(self.dataset, self.batch_size, shuffle=True)
-
+       
         for e in range(self.epochs):
             for i, (input_labels, pos_labels, neg_labels) in  enumerate(dataloader):
                 input_labels.long()
@@ -217,7 +221,9 @@ class Wo2VecPipe():
             model.load_state_dict(torch.load(home_path + "/.nlp/word2vec/embedding-{}.th".format(self.EMBEDDING_SIZE)), device)
 
 if __name__ == "__main__":
-    with open("data/剑来.txt", "r", encoding='utf-8') as f:
+
+    device = torch.device("cuda" if torch.cuda.is_available()  else "cpu")
+    with open("../../data/剑来.txt", "r", encoding='utf-8') as f:
         data = []
         for line in f.readlines():
             strip_line = line.strip()
@@ -247,5 +253,5 @@ if __name__ == "__main__":
         word_counts = np.array(list(vocab_dict.values()), dtype=np.float32)
         word_freqs = (word_counts / np.sum(word_counts))** (3./4.) # 所有的频率为原来的 0.75 次方， 论文中的推荐方法，由图像分析可推测这样可以一定程度上提高频率低的权重，降低频率高的权重
 
-        model = Wo2VecPipe()
+        model = Wo2VecPipe(device)
         model.train(text, word2idx, word_freqs)
